@@ -1,0 +1,297 @@
+// ============================================================================
+// dist_k_seg_finder_agg.script
+//
+// 目标:
+//   N 条整数点轨迹, 每条 M 个整数点 (允许重复), 找出每条轨迹中是否存在
+//   长度 >= K 的连续整数线段. 输出 (GroupId, StartX), StartX 是该 group
+//   中任意一个长度 >= K 的连续段的起点.
+//
+// 输入 schema:  GroupId : int, x : int
+// 输出 schema:  GroupId : int, StartX : int
+//
+// 算法 (block-jump union + 桶级聚合, 不排序, O(M) 时间, O(1) per-row 内存):
+//
+// Step 0. union 6 路指示器, 把每个 raw 点 x 投到 6 个 temp_x 位置:
+//           temp_x = x       I_raw  = 1   (t 处 raw)
+//           temp_x = x + 1   I_d1   = 1   (t-1 处 raw)
+//           temp_x = x - 1   I_p1   = 1   (t+1 处 raw)
+//           temp_x = x - K   I_k    = 1   (t+K 处 raw)
+//           temp_x = x - K+1 I_kd1  = 1   (t+K-1 处 raw)    [本算法暂未直接用]
+//           temp_x = x - K-1 I_kp1  = 1   (t+K+1 处 raw)
+//         然后 group by (GroupId, temp_x), 用 MAX 合并指示器.
+//
+// Step 1. group by (GroupId, bucket = temp_x / K). 桶 B 只覆盖 temp_x ∈
+//         [B*K, B*K+K-1] 这 K 行, 但每行通过 I_k / I_kp1 编码了右半窗
+//         [B*K+K, B*K+2K-1] 的 raw 信息. 取 "中点" M = B*K + K - 1.
+//
+//         关键引理: 长度 >= K 的连续段 [s, e] 起点 s 落在桶 B 左半窗
+//         [B*K, B*K+K-1] <=> M 落在该段中 <=> I_raw(M) = 1 且包含 M 的
+//         极大 raw run 长度 >= K.
+//
+//         "I_raw(M) = 1" 自动保证了 [L_M, M] 全 raw, 因为:
+//           L_M = max{ t <= M : I_raw(t)=1 AND I_d1(t)=0 }
+//         的 max 必然落在含 M 的那个 run 的起点上 (任何 (s, M] 内的位置
+//         t 由于 I_d1(t)=1 都被排除). 同理 R_M.
+//         => 不需要再单独检查 [L_M, R_M] 中间点是否 raw.
+//
+//         hit 条件:
+//           has_M_raw = 1 AND L_M IS NOT NULL
+//             AND ( R_M IS NULL OR R_M - L_M + 1 >= K )
+//
+//         R_M IS NULL 表示 run 延伸出可见 2K 窗口, 长度自动 >= K+1.
+//         若 s < B*K (run 起点不在本桶左半), 桶 B 内全部 [B*K, M] 都 raw,
+//         没有 t 能让 I_d1(t)=0, 所以 L_M IS NULL, 桶 B 不报 -- 由前一个
+//         桶 B-1 报告, 保证唯一报告权.
+//
+// Step 2. 同一 group 可能有多个桶都报告 (一个长 run 可能跨过多个 K 边界,
+//         但唯一报告权使每个具体 run 起点 s 只被起点所在桶 floor(s/K) 报),
+//         不过同一 group 可能有多个独立的长 run. 题目只要每 group 一个
+//         start, 取 MIN(StartX) GROUP BY GroupId.
+// ============================================================================
+
+#DECLARE N      int = 10000;
+#DECLARE M      int = 100;
+#DECLARE K      int = 10;
+#DECLARE XRange int = 300;
+#DECLARE Seed   int = 42;
+
+// USING(...) 的实参必须是字符串 (传给 Processor 的 args[] 是 string[]).
+// 直接由上面的 int 版本转换而来, 保持单一数据源.
+#DECLARE NStr      string = @N.ToString();
+#DECLARE MStr      string = @M.ToString();
+#DECLARE XRangeStr string = @XRange.ToString();
+#DECLARE SeedStr   string = @Seed.ToString();
+#DECLARE KStr      string = @K.ToString();
+
+#DECLARE RootPath     string = "${YourPath}/outputs/block_jump_sampling";
+#DECLARE OutputRaw    string = @RootPath + "/dist_k_seg_agg/raw.tsv";
+#DECLARE OutputResult string = @RootPath + "/dist_k_seg_agg/seg_result.tsv";
+
+// ---------------------------------------------------------------------------
+// Step -1: 生成随机数据 (driver + Processor, 集群上分布生成).
+// ---------------------------------------------------------------------------
+Driver =
+    SELECT 1 AS Dummy
+    FROM (VALUES(1)) AS T(Dummy);
+
+RawData =
+    PROCESS Driver
+    USING RandomTrajectoryGenerator(@NStr, @MStr, @XRangeStr, @SeedStr);
+
+OUTPUT RawData
+TO @OutputRaw
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+// ---------------------------------------------------------------------------
+// Step 0: union 5 路指示器 (实际用到的: I_raw, I_d1, I_p1, I_k, I_kp1).
+// ---------------------------------------------------------------------------
+Exploded =
+    SELECT GroupId, x         AS temp_x, 1 AS I_raw, 0 AS I_d1, 0 AS I_p1, 0 AS I_k, 0 AS I_kp1 FROM RawData
+    UNION ALL
+    SELECT GroupId, x + 1     AS temp_x, 0 AS I_raw, 1 AS I_d1, 0 AS I_p1, 0 AS I_k, 0 AS I_kp1 FROM RawData
+    UNION ALL
+    SELECT GroupId, x - 1     AS temp_x, 0 AS I_raw, 0 AS I_d1, 1 AS I_p1, 0 AS I_k, 0 AS I_kp1 FROM RawData
+    UNION ALL
+    SELECT GroupId, x - @K    AS temp_x, 0 AS I_raw, 0 AS I_d1, 0 AS I_p1, 1 AS I_k, 0 AS I_kp1 FROM RawData
+    UNION ALL
+    SELECT GroupId, x - @K - 1 AS temp_x, 0 AS I_raw, 0 AS I_d1, 0 AS I_p1, 0 AS I_k, 1 AS I_kp1 FROM RawData;
+
+// 每个 (GroupId, temp_x) 合并指示器 (允许 raw 点重复; MAX 即 OR).
+// 同时算出 bucket / M_pos (都是 temp_x 的纯函数), 让下游聚合表达式更清晰.
+//   bucket = floor(temp_x / K)   (floor 除法以正确处理负 temp_x)
+//   M_pos  = bucket * K + K - 1  (该桶左半窗最后一格, 即 2K 窗口的中点)
+Combined =
+    SELECT GroupId,
+           temp_x,
+           MAX((temp_x - ((temp_x % @K + @K) % @K)) / @K)         AS bucket,
+           MAX((temp_x - ((temp_x % @K + @K) % @K)) + @K - 1)     AS M_pos,
+           (int) MAX(I_raw)  AS I_raw,
+           (int) MAX(I_d1)   AS I_d1,
+           (int) MAX(I_p1)   AS I_p1,
+           (int) MAX(I_k)    AS I_k,
+           (int) MAX(I_kp1)  AS I_kp1
+    FROM Exploded
+    GROUP BY GroupId, temp_x;
+
+// ---------------------------------------------------------------------------
+// Step 1: 桶级聚合, 计算 has_M_raw / L_M / R_M. bucket / M_pos 已在上一步算好.
+// ---------------------------------------------------------------------------
+BucketAgg =
+    SELECT GroupId,
+           bucket,
+           MAX(M_pos)                                                       AS M_pos,
+           (int) MAX(I_raw == 1 && temp_x == M_pos ? 1 : 0)                 AS has_M_raw,
+           MAX(I_raw == 1 && I_d1 == 0 ? (long?) temp_x : (long?) null)     AS L_M,
+           MIN(
+               (temp_x == M_pos && I_raw == 1 && I_p1  == 0) ? (long?) temp_x :
+               (I_k    == 1     && I_kp1 == 0)               ? (long?)(temp_x + @K) :
+                                                                (long?) null
+           )                                                                AS R_M
+    FROM Combined
+    GROUP BY GroupId, bucket;
+
+// ---------------------------------------------------------------------------
+// Step 2: 命中条件 + group 级去重 (取 MIN start).
+// ---------------------------------------------------------------------------
+Hits =
+    SELECT GroupId,
+           (int) L_M.Value AS StartX
+    FROM BucketAgg
+    WHERE has_M_raw == 1
+          AND L_M != null
+          AND (R_M == null || R_M.Value - L_M.Value + 1 >= @K);
+
+SegmentResultPerGroup =
+    SELECT GroupId, MIN(StartX) AS StartX
+    FROM Hits
+    GROUP BY GroupId;
+
+OUTPUT SegmentResultPerGroup
+TO @OutputResult
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+
+// ###########################################################################
+// >>> VERIFY-BLOCK-BEGIN  (cross-check via sort+scan reducer; remove later) <<<
+// 用 REDUCE ON GroupId PRESORT x ASC + 单趟扫描的 "ground truth" 算法,
+// 与上面的桶级聚合结果对比. 任何 GroupId 在两种算法下 hit/miss 不一致, 或
+// 都 hit 但起点不属于同一连续段, 都会被记录到 @OutputDiff.
+// 整块 (含 #DECLARE / 两个 OUTPUT / Reducer 类) 都用 VERIFY-BLOCK 标记包裹,
+// 后续可以一次性删除.
+// ###########################################################################
+
+#DECLARE OutputResultSort string = @RootPath + "/dist_k_seg_agg/seg_result_sort.tsv";
+#DECLARE OutputDiff       string = @RootPath + "/dist_k_seg_agg/seg_result_diff.tsv";
+// KStr 已在上方由 @K 派生, 这里直接复用, 避免两份常量漂移.
+
+SegmentResultSort =
+    REDUCE RawData
+    ON GroupId
+    PRESORT x ASC
+    USING SegmentFinderSortReducer(@KStr);
+
+OUTPUT SegmentResultSort
+TO @OutputResultSort
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+// 两种算法结果的对比 (full outer join). 一致的 group 不会出现在 Diff 流中.
+//   - 一种 hit 一种 miss      => Status = "ONLY_AGG" 或 "ONLY_SORT"
+//   - 都 hit 但起点不在同一连续段 => Status = "DIFF_RUN" (起点之差超出 run 长度,
+//     由于两边都只输出"任意一个" start, 同一 run 内不同起点都合法, 因此只要
+//     |a-b| < K 视为同 run)
+SegAgg =
+    SELECT GroupId, StartX AS StartAgg FROM SegmentResultPerGroup;
+
+SegSort =
+    SELECT GroupId, StartX AS StartSort FROM SegmentResultSort;
+
+Diff =
+    SELECT (a.GroupId == null ? b.GroupId : a.GroupId) AS GroupId,
+           a.StartAgg  AS StartAgg,
+           b.StartSort AS StartSort,
+           (a.GroupId == null) ? "ONLY_SORT" :
+           (b.GroupId == null) ? "ONLY_AGG"  :
+           (Math.Abs(a.StartAgg.Value - b.StartSort.Value) >= @K) ? "DIFF_RUN" : "OK"
+               AS Status
+    FROM SegAgg AS a
+    FULL OUTER JOIN SegSort AS b
+    ON a.GroupId == b.GroupId;
+
+DiffOnly =
+    SELECT * FROM Diff WHERE Status != "OK";
+
+OUTPUT DiffOnly
+TO @OutputDiff
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+// >>> VERIFY-BLOCK-END <<<
+// ###########################################################################
+
+
+// ===========================================================================
+// User code
+// ===========================================================================
+#CS
+
+using ScopeRuntime;
+using System;
+using System.Collections.Generic;
+
+public class RandomTrajectoryGenerator : Processor
+{
+    public override Schema Produces(string[] requestedColumns, string[] args, Schema input)
+    {
+        Schema s = new Schema();
+        s.Add(new ColumnInfo("GroupId", ColumnDataType.Integer));
+        s.Add(new ColumnInfo("x",       ColumnDataType.Integer));
+        return s;
+    }
+
+    public override IEnumerable<Row> Process(RowSet input, Row outputRow, string[] args)
+    {
+        int N      = int.Parse(args[0]);
+        int M      = int.Parse(args[1]);
+        int XRange = int.Parse(args[2]);
+        int seed   = int.Parse(args[3]);
+
+        foreach (var _ in input.Rows) { /* consume driver */ }
+
+        for (int g = 1; g <= N; g++)
+        {
+            Random rng = new Random(unchecked(seed * 1000003 + g));
+            for (int i = 0; i < M; i++)
+            {
+                int xv = rng.Next(0, XRange);
+                outputRow["GroupId"].Set(g);
+                outputRow["x"].Set(xv);
+                yield return outputRow;
+            }
+        }
+    }
+}
+
+// ###########################################################################
+// >>> VERIFY-BLOCK-BEGIN (Reducer; remove together with the SCOPE block above)
+// ###########################################################################
+public class SegmentFinderSortReducer : Reducer
+{
+    public override Schema Produces(string[] requestedColumns, string[] args, Schema input)
+    {
+        Schema s = new Schema();
+        s.Add(new ColumnInfo("GroupId", ColumnDataType.Integer));
+        s.Add(new ColumnInfo("StartX",  ColumnDataType.Integer));
+        return s;
+    }
+
+    public override IEnumerable<Row> Reduce(RowSet input, Row outputRow, string[] args)
+    {
+        int K = int.Parse(args[0]);
+        bool hasPrev = false;
+        int prev = 0, runStart = 0, gid = 0;
+        bool found = false;
+
+        foreach (var row in input.Rows)
+        {
+            gid = row["GroupId"].Integer;
+            int x = row["x"].Integer;
+            if (!hasPrev)        { runStart = x; prev = x; hasPrev = true; }
+            else if (x == prev)  { continue; }
+            else if (x == prev+1){ prev = x; }
+            else                 { runStart = x; prev = x; }
+
+            if (prev - runStart + 1 >= K)
+            {
+                outputRow["GroupId"].Set(gid);
+                outputRow["StartX"].Set(runStart);
+                yield return outputRow;
+                found = true;
+                break;
+            }
+        }
+        if (!found) yield break;
+    }
+}
+// >>> VERIFY-BLOCK-END <<<
+// ###########################################################################
+
+#ENDCS
